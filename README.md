@@ -27,7 +27,7 @@ In this setup, the directory `/opt/local-path-provisioner` will be used across a
 
 - Stable
 ```
-kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.23/deploy/local-path-storage.yaml
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml
 ```
 
 - Development
@@ -38,7 +38,7 @@ kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisione
 Or, use `kustomize` to deploy.
 - Stable
 ```
-kustomize build "github.com/rancher/local-path-provisioner/deploy?ref=v0.0.23" | kubectl apply -f -
+kustomize build "github.com/rancher/local-path-provisioner/deploy?ref=v0.0.24" | kubectl apply -f -
 ```
 
 - Development
@@ -171,11 +171,18 @@ data:
         metadata:
           name: helper-pod
         spec:
+          priorityClassName: system-node-critical
+          tolerations:
+            - key: node.kubernetes.io/disk-pressure
+              operator: Exists
+              effect: NoSchedule
           containers:
           - name: helper-pod
             image: busybox
 
 ```
+
+The helperPod is allowed to run on nodes experiencing disk pressure conditions, despite the potential resource constraints. When it runs on such a node, it can carry out specific cleanup tasks, freeing up space in PVCs, and resolving the disk-pressure issue.
 
 #### `config.json`
 
@@ -231,6 +238,42 @@ If the reload fails, the provisioner will log the error and **continue using the
 
 >time="2018-10-03T06:39:28Z" level=error msg="failed to load the new config file: config canonicalization failed: duplicate node yasker-lp-dev3"
 
+### Volume Types
+
+To specify the type of volume you want the provisioner to create, add either of the following annotations;
+
+- PVC:
+```yaml
+annotations:
+  volumeType: <local or hostPath>
+```
+
+- StorageClass:
+```yaml
+annotations:
+  defaultVolumeType: <local or hostPath>
+```
+
+A few things to note; the annotation for the `StorageClass` will apply to all volumes using it and is superseded by the annotation on the PVC if one is provided. If neither of the annotations was provided then we default to `hostPath`.
+
+### Storage classes
+
+If more than one `paths` are specified in the `nodePathMap` the path is chosen randomly. To make the provisioner choose a specific path, use a `storageClass` defined with a parameter called `nodePath`. Note that this path should be defined in the `nodePathMap`
+
+```
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ssd-local-path
+provisioner: cluster.local/local-path-provisioner
+parameters:
+  nodePath: /data/ssd
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+```
+
+Here the provisioner will use the path `/data/ssd` when storage class `ssd-local-path` is used.
+
 ## Uninstall
 
 Before uninstallation, make sure the PVs created by the provisioner have already been deleted. Use `kubectl get pv` and make sure no PV with StorageClass `local-path`.
@@ -239,7 +282,7 @@ To uninstall, execute:
 
 - Stable
 ```
-kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.23/deploy/local-path-storage.yaml
+kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml
 ```
 
 - Development

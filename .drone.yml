@@ -152,7 +152,14 @@ platform:
   os: linux
   arch: arm
 
+# ad-hoc fix:
+# disable the use of upstream images https://github.com/rancherlabs/eio/issues/1493
+clone:
+  disable: true
+
 steps:
+- name: clone
+  image: drone/git:linux-arm
 - name: build
   image: rancher/dapper:v0.4.2
   commands:
@@ -162,7 +169,7 @@ steps:
     path: /var/run/docker.sock
 
 - name: github_binary_release
-  image: plugins/github-release
+  image: plugins/github-release:linux-arm
   settings:
     api_key:
       from_secret: github_token
@@ -180,7 +187,7 @@ steps:
     - tag
 
 - name: docker-publish
-  image: plugins/docker
+  image: plugins/docker:linux-arm
   settings:
     dockerfile: package/Dockerfile
     password:
@@ -196,7 +203,7 @@ steps:
     - push
 
 - name: docker-tagged-publish
-  image: plugins/docker
+  image: plugins/docker:linux-arm
   settings:
     dockerfile: package/Dockerfile
     password:

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,7 +18,8 @@ import (
 	k8serror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
-	pvController "sigs.k8s.io/sig-storage-lib-external-provisioner/controller"
+
+	pvController "sigs.k8s.io/sig-storage-lib-external-provisioner/v8/controller"
 )
 
 type ActionType string
@@ -43,6 +45,11 @@ const (
 
 const (
 	defaultCmdTimeoutSeconds = 120
+	defaultVolumeType        = "hostPath"
+)
+
+const (
+	nodeNameAnnotationKey = "local.path.provisioner/selected-node"
 )
 
 var (
@@ -52,7 +59,7 @@ var (
 )
 
 type LocalPathProvisioner struct {
-	stopCh             chan struct{}
+	ctx                context.Context
 	kubeClient         *clientset.Clientset
 	namespace          string
 	helperImage        string
@@ -72,8 +79,8 @@ type NodePathMapData struct {
 }
 
 type ConfigData struct {
-	NodePathMap []*NodePathMapData `json:"nodePathMap,omitempty"`
-	CmdTimeoutSeconds int `json:"cmdTimeoutSeconds,omitempty"`
+	NodePathMap          []*NodePathMapData `json:"nodePathMap,omitempty"`
+	CmdTimeoutSeconds    int                `json:"cmdTimeoutSeconds,omitempty"`
 	SharedFileSystemPath string             `json:"sharedFileSystemPath,omitempty"`
 }
 
@@ -82,15 +89,15 @@ type NodePathMap struct {
 }
 
 type Config struct {
-	NodePathMap       map[string]*NodePathMap
-	CmdTimeoutSeconds int
+	NodePathMap          map[string]*NodePathMap
+	CmdTimeoutSeconds    int
 	SharedFileSystemPath string
 }
 
-func NewProvisioner(stopCh chan struct{}, kubeClient *clientset.Clientset,
+func NewProvisioner(ctx context.Context, kubeClient *clientset.Clientset,
 	configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml string) (*LocalPathProvisioner, error) {
 	p := &LocalPathProvisioner{
-		stopCh: stopCh,
+		ctx: ctx,
 
 		kubeClient:         kubeClient,
 		namespace:          namespace,
@@ -155,7 +162,7 @@ func (p *LocalPathProvisioner) watchAndRefreshConfig() {
 				if err := p.refreshConfig(); err != nil {
 					logrus.Errorf("failed to load the new config file: %v", err)
 				}
-			case <-p.stopCh:
+			case <-p.ctx.Done():
 				logrus.Infof("stop watching config file")
 				return
 			}
@@ -163,7 +170,7 @@ func (p *LocalPathProvisioner) watchAndRefreshConfig() {
 	}()
 }
 
-func (p *LocalPathProvisioner) getRandomPathOnNode(node string) (string, error) {
+func (p *LocalPathProvisioner) getPathOnNode(node string, requestedPath string) (string, error) {
 	p.configMutex.RLock()
 	defer p.configMutex.RUnlock()
 
@@ -193,6 +200,14 @@ func (p *LocalPathProvisioner) getRandomPathOnNode(node string) (string, error) 
 	if len(paths) == 0 {
 		return "", fmt.Errorf("no local path available on node %v", node)
 	}
+	// if a particular path was requested by storage class
+	if requestedPath != "" {
+		if _, ok := paths[requestedPath]; !ok {
+			return "", fmt.Errorf("config doesn't contain path %v on node %v", requestedPath, node)
+		}
+		return requestedPath, nil
+	}
+	// if no particular path was requested, choose a random one
 	path := ""
 	for path = range paths {
 		break
@@ -224,24 +239,25 @@ func (p *LocalPathProvisioner) isSharedFilesystem() (bool, error) {
 	return false, fmt.Errorf("both nodePathMap and sharedFileSystemPath are unconfigured")
 }
 
-func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v1.PersistentVolume, error) {
+func (p *LocalPathProvisioner) Provision(ctx context.Context, opts pvController.ProvisionOptions) (*v1.PersistentVolume, pvController.ProvisioningState, error) {
 	pvc := opts.PVC
 	node := opts.SelectedNode
+	storageClass := opts.StorageClass
 	sharedFS, err := p.isSharedFilesystem()
 	if err != nil {
-		return nil, err
+		return nil, pvController.ProvisioningFinished, err
 	}
 	if !sharedFS {
 		if pvc.Spec.Selector != nil {
-			return nil, fmt.Errorf("claim.Spec.Selector is not supported")
+			return nil, pvController.ProvisioningFinished, fmt.Errorf("claim.Spec.Selector is not supported")
 		}
 		for _, accessMode := range pvc.Spec.AccessModes {
 			if accessMode != v1.ReadWriteOnce {
-				return nil, fmt.Errorf("Only support ReadWriteOnce access mode")
+				return nil, pvController.ProvisioningFinished, fmt.Errorf("Only support ReadWriteOnce access mode")
 			}
 		}
 		if node == nil {
-			return nil, fmt.Errorf("configuration error, no node was specified")
+			return nil, pvController.ProvisioningFinished, fmt.Errorf("configuration error, no node was specified")
 		}
 	}
 
@@ -250,9 +266,15 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 		// This clause works only with sharedFS
 		nodeName = node.Name
 	}
-	basePath, err := p.getRandomPathOnNode(nodeName)
+	var requestedPath string
+	if storageClass.Parameters != nil {
+		if _, ok := storageClass.Parameters["nodePath"]; ok {
+			requestedPath = storageClass.Parameters["nodePath"]
+		}
+	}
+	basePath, err := p.getPathOnNode(nodeName, requestedPath)
 	if err != nil {
-		return nil, err
+		return nil, pvController.ProvisioningFinished, err
 	}
 
 	name := opts.PVName
@@ -274,26 +296,24 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 		SizeInBytes: storage.Value(),
 		Node:        nodeName,
 	}); err != nil {
-		return nil, err
+		return nil, pvController.ProvisioningFinished, err
 	}
 
 	fs := v1.PersistentVolumeFilesystem
 
 	var pvs v1.PersistentVolumeSource
-	if val, ok := opts.PVC.GetAnnotations()["volumeType"]; ok && strings.ToLower(val) == "local" {
-		pvs = v1.PersistentVolumeSource{
-			Local: &v1.LocalVolumeSource{
-				Path: path,
-			},
-		}
+	var volumeType string
+	if dVal, ok := opts.StorageClass.GetAnnotations()["defaultVolumeType"]; ok {
+		volumeType = dVal
 	} else {
-		hostPathType := v1.HostPathDirectoryOrCreate
-		pvs = v1.PersistentVolumeSource{
-			HostPath: &v1.HostPathVolumeSource{
-				Path: path,
-				Type: &hostPathType,
-			},
-		}
+		volumeType = defaultVolumeType
+	}
+	if val, ok := opts.PVC.GetAnnotations()["volumeType"]; ok {
+		volumeType = val
+	}
+	pvs, err = createPersistentVolumeSource(volumeType, path)
+	if err != nil {
+		return nil, pvController.ProvisioningFinished, err
 	}
 
 	var nodeAffinity *v1.VolumeNodeAffinity
@@ -326,22 +346,23 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 	}
 	return &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
+			Name:        name,
+			Annotations: map[string]string{nodeNameAnnotationKey: nodeName},
 		},
 		Spec: v1.PersistentVolumeSpec{
 			PersistentVolumeReclaimPolicy: *opts.StorageClass.ReclaimPolicy,
 			AccessModes:                   pvc.Spec.AccessModes,
 			VolumeMode:                    &fs,
 			Capacity: v1.ResourceList{
-				v1.ResourceName(v1.ResourceStorage): pvc.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
+				v1.ResourceStorage: pvc.Spec.Resources.Requests[v1.ResourceStorage],
 			},
 			PersistentVolumeSource: pvs,
-			NodeAffinity: nodeAffinity,
+			NodeAffinity:           nodeAffinity,
 		},
-	}, nil
+	}, pvController.ProvisioningFinished, nil
 }
 
-func (p *LocalPathProvisioner) Delete(pv *v1.PersistentVolume) (err error) {
+func (p *LocalPathProvisioner) Delete(ctx context.Context, pv *v1.PersistentVolume) (err error) {
 	defer func() {
 		err = errors.Wrapf(err, "failed to delete volume %v", pv.Name)
 	}()
@@ -518,6 +539,7 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, 
 	if o.Node != "" {
 		helperPod.Spec.NodeName = o.Node
 	}
+	privileged := true
 	helperPod.Spec.ServiceAccountName = p.serviceAccountName
 	helperPod.Spec.RestartPolicy = v1.RestartPolicyNever
 	helperPod.Spec.Tolerations = append(helperPod.Spec.Tolerations, lpvTolerations...)
@@ -527,17 +549,20 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, 
 	helperPod.Spec.Containers[0].Args = []string{"-p", filepath.Join(parentDir, volumeDir),
 		"-s", strconv.FormatInt(o.SizeInBytes, 10),
 		"-m", string(o.Mode)}
+	helperPod.Spec.Containers[0].SecurityContext = &v1.SecurityContext{
+		Privileged: &privileged,
+	}
 
 	// If it already exists due to some previous errors, the pod will be cleaned up later automatically
 	// https://github.com/rancher/local-path-provisioner/issues/27
 	logrus.Infof("create the helper pod %s into %s", helperPod.Name, p.namespace)
-	_, err = p.kubeClient.CoreV1().Pods(p.namespace).Create(helperPod)
+	_, err = p.kubeClient.CoreV1().Pods(p.namespace).Create(context.TODO(), helperPod, metav1.CreateOptions{})
 	if err != nil && !k8serror.IsAlreadyExists(err) {
 		return err
 	}
 
 	defer func() {
-		e := p.kubeClient.CoreV1().Pods(p.namespace).Delete(helperPod.Name, &metav1.DeleteOptions{})
+		e := p.kubeClient.CoreV1().Pods(p.namespace).Delete(context.TODO(), helperPod.Name, metav1.DeleteOptions{})
 		if e != nil {
 			logrus.Errorf("unable to delete the helper pod: %v", e)
 		}
@@ -545,7 +570,7 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, 
 
 	completed := false
 	for i := 0; i < p.config.CmdTimeoutSeconds; i++ {
-		if pod, err := p.kubeClient.CoreV1().Pods(p.namespace).Get(helperPod.Name, metav1.GetOptions{}); err != nil {
+		if pod, err := p.kubeClient.CoreV1().Pods(p.namespace).Get(context.TODO(), helperPod.Name, metav1.GetOptions{}); err != nil {
 			return err
 		} else if pod.Status.Phase == v1.PodSucceeded {
 			completed = true
@@ -648,4 +673,31 @@ func canonicalizeConfig(data *ConfigData) (cfg *Config, err error) {
 		cfg.CmdTimeoutSeconds = defaultCmdTimeoutSeconds
 	}
 	return cfg, nil
+}
+
+func createPersistentVolumeSource(volumeType string, path string) (pvs v1.PersistentVolumeSource, err error) {
+	defer func() {
+		err = errors.Wrapf(err, "failed to create persistent volume source")
+	}()
+
+	switch strings.ToLower(volumeType) {
+	case "local":
+		pvs = v1.PersistentVolumeSource{
+			Local: &v1.LocalVolumeSource{
+				Path: path,
+			},
+		}
+	case "hostpath":
+		hostPathType := v1.HostPathDirectoryOrCreate
+		pvs = v1.PersistentVolumeSource{
+			HostPath: &v1.HostPathVolumeSource{
+				Path: path,
+				Type: &hostPathType,
+			},
+		}
+	default:
+		return pvs, fmt.Errorf("\"%s\" is not a recognised volume type", volumeType)
+	}
+
+	return pvs, nil
 }
